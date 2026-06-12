@@ -37,6 +37,7 @@ import { getClock } from '@/testing-library'
 import type { Agent, AgentAdapterContext } from '@/types/acp'
 import type { AcpTransport } from './types'
 import { connectAcpAdapter, type AcpAdapterContext } from './acp-adapter'
+import type { AcpCommand } from './translators/acp-to-ai-sdk'
 
 const remoteAgent: Agent = {
   id: 'remote-foo',
@@ -255,6 +256,49 @@ describe('connectAcpAdapter — handshake failure modes', () => {
     // The body must close so the AI SDK leaves the streaming state.
     expect(sse).toContain('[CLOSED]')
   })
+
+  it('folds resolved skill instructions into the prompt ahead of the user text', async () => {
+    const { transport } = buildFakeTransport()
+    const { FakeConnection, calls, releasePrompts } = buildFakeConnection()
+
+    const adapter = await connectAcpAdapter(remoteAgent, baseCtx(), {
+      openTransport: async () => transport,
+      ClientSideConnection: FakeConnection as never,
+    })
+
+    const response = await adapter.fetch(
+      promptInit('/tell-a-joke'),
+      threadCtx('t1', { skillInstructions: ['Tell a joke about cats, then give a time and place to tell it.'] }),
+    )
+    await act(async () => {
+      releasePrompts()
+      await getClock().runAllAsync()
+      await readSse(response)
+    })
+
+    const sent = calls.prompt[0]?.prompt?.[0] as { type: string; text: string }
+    expect(sent.text).toBe('Tell a joke about cats, then give a time and place to tell it.\n\n/tell-a-joke')
+  })
+
+  it('sends the user text unchanged when no skill instructions resolved', async () => {
+    const { transport } = buildFakeTransport()
+    const { FakeConnection, calls, releasePrompts } = buildFakeConnection()
+
+    const adapter = await connectAcpAdapter(remoteAgent, baseCtx(), {
+      openTransport: async () => transport,
+      ClientSideConnection: FakeConnection as never,
+    })
+
+    const response = await adapter.fetch(promptInit('just a normal message'), threadCtx('t1'))
+    await act(async () => {
+      releasePrompts()
+      await getClock().runAllAsync()
+      await readSse(response)
+    })
+
+    const sent = calls.prompt[0]?.prompt?.[0] as { type: string; text: string }
+    expect(sent.text).toBe('just a normal message')
+  })
 })
 
 describe('connectAcpAdapter — per-thread session multiplexing over one connection', () => {
@@ -352,5 +396,63 @@ describe('connectAcpAdapter — per-thread session multiplexing over one connect
     expect(joinedA).not.toContain('BETA')
     expect(joinedB).toContain('BETA')
     expect(joinedB).not.toContain('ALPHA')
+  })
+})
+
+describe('connectAcpAdapter — agent-level command capture', () => {
+  it('ensureSession resolves a session without a prompt, then available_commands_update flows to onAvailableCommands', async () => {
+    const { transport } = buildFakeTransport()
+    const { FakeConnection, calls, pushUpdate } = buildFakeConnection()
+
+    const captured: AcpCommand[][] = []
+    const adapter = await connectAcpAdapter(
+      remoteAgent,
+      baseCtx({ onAvailableCommands: (commands) => captured.push(commands) }),
+      {
+        openTransport: async () => transport,
+        ClientSideConnection: FakeConnection as never,
+      },
+    )
+
+    // Warm the thread's session — no prompt is sent.
+    await adapter.ensureSession(threadCtx('thread-warm'))
+    expect(calls.newSession).toHaveLength(1)
+    expect(calls.prompt).toHaveLength(0)
+
+    // The agent advertises its commands on that session, outside any turn.
+    await act(async () => {
+      pushUpdate({
+        sessionId: 'sess-1',
+        update: {
+          sessionUpdate: 'available_commands_update',
+          availableCommands: [
+            { name: 'research_codebase', description: 'Explore the codebase', input: { hint: 'topic' } },
+            { name: 'create_plan', description: 'Draft a plan' },
+          ],
+        },
+      } as SessionNotification)
+      await getClock().runAllAsync()
+    })
+
+    expect(captured).toEqual([
+      [
+        { name: 'research_codebase', description: 'Explore the codebase', inputHint: 'topic' },
+        { name: 'create_plan', description: 'Draft a plan', inputHint: undefined },
+      ],
+    ])
+  })
+
+  it('a second ensureSession on the same thread reuses the cached session', async () => {
+    const { transport } = buildFakeTransport()
+    const { FakeConnection, calls } = buildFakeConnection()
+
+    const adapter = await connectAcpAdapter(remoteAgent, baseCtx(), {
+      openTransport: async () => transport,
+      ClientSideConnection: FakeConnection as never,
+    })
+
+    await adapter.ensureSession(threadCtx('thread-1'))
+    await adapter.ensureSession(threadCtx('thread-1'))
+    expect(calls.newSession).toHaveLength(1)
   })
 })
